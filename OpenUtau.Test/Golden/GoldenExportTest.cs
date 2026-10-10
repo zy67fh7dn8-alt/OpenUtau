@@ -26,8 +26,9 @@ namespace OpenUtau.Core.Golden {
     ///   GOLDEN_UST=path/to/main.ust GOLDEN_SINGER=path/to/voicebank GOLDEN_OUT=path/to/golden/case \
     ///     OpenUtau.Test/bin/Debug/net10.0/OpenUtau.Test -class OpenUtau.Core.Golden.GoldenExportTest
     ///
-    /// Outputs (renderer is fixed to WORLDLINE-R):
-    ///   input.json           notes parsed from the UST (stage 0)
+    /// Outputs (renderer is fixed to WORLDLINE-R; the user's OpenUtau prefs and presets are not read):
+    ///   ust.json             Ust.Load(reader, file) result, before AfterLoad/Validate (stage 0)
+    ///   input.json           notes after Ust.Load(files), i.e. after AfterLoad and ValidateFull (stage 0)
     ///   phonemes.json        phonemizer output after timing validation (stage 1)
     ///   phrases.json         RenderPhrase.FromPart output (stage 2)
     ///   resampler_items.json ResamplerItem per phone, and the PhraseSynthV2.AddRequest arguments (stage 3)
@@ -60,13 +61,18 @@ namespace OpenUtau.Core.Golden {
             Assert.True(Directory.Exists(singerDir), $"GOLDEN_SINGER not found: {singerDir}");
             Directory.CreateDirectory(outDir);
 
+            // Must come first: Preferences and NotePresets load from DataPath on first use.
+            var tempDir = UseTempDataDirs();
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
             UseWorldlineFromRepo();
-            var cacheDir = UseTempCache();
             // Registers the built-in resamplers (worldline) that ResamplerItem looks up.
             ToolsManager.Inst.Initialize();
             try {
                 var singer = LoadSinger(singerDir);
+
+                using (var reader = new StreamReader(ustPath, Ust.DetectEncoding(ustPath))) {
+                    Write(outDir, "ust.json", ExportUst(Ust.Load(reader, ustPath)));
+                }
 
                 var project = Ust.Load(new[] { ustPath });
                 var track = project.tracks[0];
@@ -96,7 +102,7 @@ namespace OpenUtau.Core.Golden {
                 Write(outDir, "synth_curves.json", curves);
                 output.WriteLine($"notes={part.notes.Count} phonemes={part.phonemes.Count} phrases={phrases.Count} -> {outDir}");
             } finally {
-                Directory.Delete(cacheDir, true);
+                Directory.Delete(tempDir, true);
             }
         }
 
@@ -121,13 +127,15 @@ namespace OpenUtau.Core.Golden {
         }
 
         /// <summary>
-        /// Points the render cache at an empty temp dir, so a cached (16-bit) wav from a previous run or
-        /// from the OpenUtau app is never read back.
+        /// Points DataPath and CachePath at an empty temp dir, so that the output does not depend on the
+        /// OpenUtau app installed on this machine: its prefs.json, notepresets.json, resamplers and singers
+        /// are not read, and a cached (16-bit) wav from a previous run is never read back.
         /// </summary>
-        static string UseTempCache() {
+        static string UseTempDataDirs() {
             var dir = Path.Join(Path.GetTempPath(), $"openutau-golden-{Guid.NewGuid():N}");
-            Directory.CreateDirectory(dir);
-            typeof(PathManager).GetProperty(nameof(PathManager.CachePath))!.SetValue(PathManager.Inst, dir);
+            Directory.CreateDirectory(Path.Join(dir, "Cache"));
+            typeof(PathManager).GetProperty(nameof(PathManager.DataPath))!.SetValue(PathManager.Inst, dir);
+            typeof(PathManager).GetProperty(nameof(PathManager.CachePath))!.SetValue(PathManager.Inst, Path.Join(dir, "Cache"));
             return dir;
         }
 
@@ -190,6 +198,36 @@ namespace OpenUtau.Core.Golden {
                 vibrato = new { n.vibrato.length, n.vibrato.period, n.vibrato.depth, n.vibrato.@in, n.vibrato.@out, n.vibrato.shift, n.vibrato.drift },
             }),
         };
+
+        static object ExportUst(UProject project) {
+            var track = project.tracks[0];
+            var part = project.parts.OfType<UVoicePart>().First();
+            return new {
+                project.name,
+                project.resolution,
+                tempos = project.tempos.Select(t => new { t.position, t.bpm }),
+                timeSignatures = project.timeSignatures.Select(t => new { t.barPosition, t.beatPerBar, t.beatUnit }),
+                track = new {
+                    singer = track.Singer?.Name,
+                    expressions = track.TrackExpressions.Select(e => new { e.abbr, e.flag, value = e.CustomDefaultValue }),
+                },
+                part = new { part.name, part.position, part.Duration },
+                notes = part.notes.Select((n, i) => new {
+                    index = i,
+                    n.position,
+                    n.duration,
+                    n.tone,
+                    n.lyric,
+                    n.tuning,
+                    pitch = new {
+                        n.pitch.snapFirst,
+                        data = n.pitch.data.Select(p => new { p.X, p.Y, shape = p.shape.ToString() }),
+                    },
+                    vibrato = new { n.vibrato.length, n.vibrato.period, n.vibrato.depth, n.vibrato.@in, n.vibrato.@out, n.vibrato.shift, n.vibrato.drift, n.vibrato.volLink },
+                    expressions = n.phonemeExpressions.Select(e => new { e.abbr, e.index, e.value }),
+                }),
+            };
+        }
 
         static object ExportPhonemes(UVoicePart part) {
             var notes = part.notes.ToList();
