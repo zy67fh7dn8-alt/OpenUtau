@@ -9,7 +9,9 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using NAudio.Wave;
 using OpenUtau.Api;
 using OpenUtau.Classic;
 using OpenUtau.Core.Render;
@@ -22,12 +24,15 @@ namespace OpenUtau.Core.Golden {
     /// Does nothing unless GOLDEN_OUT is set, so the normal test run is unaffected.
     ///
     ///   GOLDEN_UST=path/to/main.ust GOLDEN_SINGER=path/to/voicebank GOLDEN_OUT=path/to/golden/case \
-    ///     dotnet test OpenUtau.Test --filter FullyQualifiedName~GoldenExportTest
+    ///     OpenUtau.Test/bin/Debug/net10.0/OpenUtau.Test -class OpenUtau.Core.Golden.GoldenExportTest
     ///
-    /// Outputs:
-    ///   input.json    notes parsed from the UST (stage 0)
-    ///   phonemes.json phonemizer output after timing validation (stage 1)
-    ///   phrases.json  RenderPhrase.FromPart output (stage 2)
+    /// Outputs (renderer is fixed to WORLDLINE-R):
+    ///   input.json           notes parsed from the UST (stage 0)
+    ///   phonemes.json        phonemizer output after timing validation (stage 1)
+    ///   phrases.json         RenderPhrase.FromPart output (stage 2)
+    ///   resampler_items.json ResamplerItem per phone, and the PhraseSynthV2.AddRequest arguments (stage 3)
+    ///   synth_curves.json    per-frame curves passed to PhraseSynthV2.SetCurves (stage 3)
+    ///   phrase_N.wav         WorldlineRenderer output per phrase, 44.1kHz mono float32 (stage 4)
     /// </summary>
     public class GoldenExportTest {
         readonly ITestOutputHelper output;
@@ -56,20 +61,79 @@ namespace OpenUtau.Core.Golden {
             Directory.CreateDirectory(outDir);
 
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-            var singer = LoadSinger(singerDir);
+            UseWorldlineFromRepo();
+            var cacheDir = UseTempCache();
+            // Registers the built-in resamplers (worldline) that ResamplerItem looks up.
+            ToolsManager.Inst.Initialize();
+            try {
+                var singer = LoadSinger(singerDir);
 
-            var project = Ust.Load(new[] { ustPath });
-            var track = project.tracks[0];
-            var part = project.parts.OfType<UVoicePart>().First();
-            track.Singer = singer;
+                var project = Ust.Load(new[] { ustPath });
+                var track = project.tracks[0];
+                var part = project.parts.OfType<UVoicePart>().First();
+                track.Singer = singer;
+                track.RendererSettings.renderer = Renderers.WORLDLINE_R;
 
-            Phonemize(project, part);
-            var phrases = RenderPhrase.FromPart(project, track, part);
+                Phonemize(project, part);
+                var phrases = RenderPhrase.FromPart(project, track, part);
 
-            Write(outDir, "input.json", ExportInput(project, part, ustPath, singerDir));
-            Write(outDir, "phonemes.json", ExportPhonemes(part));
-            Write(outDir, "phrases.json", phrases.Select(ph => ExportPhrase(ph, part.position)).ToList());
-            output.WriteLine($"notes={part.notes.Count} phonemes={part.phonemes.Count} phrases={phrases.Count} -> {outDir}");
+                Write(outDir, "input.json", ExportInput(project, part, ustPath, singerDir));
+                Write(outDir, "phonemes.json", ExportPhonemes(part));
+                Write(outDir, "phrases.json", phrases.Select(ph => ExportPhrase(ph, part.position)).ToList());
+
+                var renderer = new WorldlineRenderer(version: 10);
+                Assert.Equal(Renderers.WORLDLINE_R, track.RendererSettings.Renderer.ToString());
+                var items = new List<object>();
+                var curves = new List<object>();
+                for (int i = 0; i < phrases.Count; i++) {
+                    var phrase = phrases[i];
+                    items.Add(phrase.phones.Select(phone => ExportResamplerItem(phrase, new ResamplerItem(phrase, phone))).ToList());
+                    curves.Add(ExportSynthCurves(renderer, phrase));
+                    var result = renderer.Render(phrase, new Progress(phrase.phones.Length), 0, new CancellationTokenSource(), false).Result;
+                    WriteFloatWav(Path.Join(outDir, $"phrase_{i}.wav"), result.samples);
+                }
+                Write(outDir, "resampler_items.json", items);
+                Write(outDir, "synth_curves.json", curves);
+                output.WriteLine($"notes={part.notes.Count} phonemes={part.phonemes.Count} phrases={phrases.Count} -> {outDir}");
+            } finally {
+                Directory.Delete(cacheDir, true);
+            }
+        }
+
+        static bool worldlineResolverSet;
+
+        /// <summary>
+        /// The test project does not copy runtimes/ to its output, so resolve "worldline" from the repo's runtimes/.
+        /// </summary>
+        static void UseWorldlineFromRepo() {
+            if (worldlineResolverSet || !OperatingSystem.IsMacOS()) {
+                return;
+            }
+            var dir = new DirectoryInfo(Path.GetDirectoryName(typeof(GoldenExportTest).Assembly.Location)!);
+            while (dir != null && !File.Exists(Path.Join(dir.FullName, "runtimes", "osx", "native", "libworldline.dylib"))) {
+                dir = dir.Parent;
+            }
+            Assert.True(dir != null, "runtimes/osx/native/libworldline.dylib not found.");
+            var lib = Path.Join(dir!.FullName, "runtimes", "osx", "native", "libworldline.dylib");
+            NativeLibrary.SetDllImportResolver(typeof(WorldlineRenderer).Assembly, (name, assembly, path) =>
+                name == "worldline" ? NativeLibrary.Load(lib) : IntPtr.Zero);
+            worldlineResolverSet = true;
+        }
+
+        /// <summary>
+        /// Points the render cache at an empty temp dir, so a cached (16-bit) wav from a previous run or
+        /// from the OpenUtau app is never read back.
+        /// </summary>
+        static string UseTempCache() {
+            var dir = Path.Join(Path.GetTempPath(), $"openutau-golden-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            typeof(PathManager).GetProperty(nameof(PathManager.CachePath))!.SetValue(PathManager.Inst, dir);
+            return dir;
+        }
+
+        static void WriteFloatWav(string path, float[] samples) {
+            using var writer = new WaveFileWriter(path, WaveFormat.CreateIeeeFloatWaveFormat(44100, 1));
+            writer.WriteSamples(samples, 0, samples.Length);
         }
 
         static ClassicSinger LoadSinger(string singerDir) {
@@ -155,6 +219,63 @@ namespace OpenUtau.Core.Golden {
             oto.Preutter,
             oto.Overlap,
         };
+
+        static object ExportResamplerItem(RenderPhrase phrase, ResamplerItem item) {
+            // Same arguments as WorldlineRenderer.Render passes to PhraseSynthV2.AddRequest.
+            double posMs = item.phone.positionMs - item.phone.leadingMs - (phrase.positionMs - phrase.leadingMs);
+            double lengthMs = item.phone.envelope[4].X - item.phone.envelope[0].X;
+            double fadeInMs = item.phone.envelope[1].X - item.phone.envelope[0].X;
+            double fadeOutMs = item.phone.envelope[4].X - item.phone.envelope[3].X;
+            return new {
+                item.phone.phoneme,
+                inputFile = Path.GetFileName(item.inputFile),
+                resampler = item.resampler.ToString(),
+                item.tone,
+                flags = item.flags.Select(f => new { flag = f.Item1, value = f.Item2, abbr = f.Item3 }),
+                flagsString = item.GetFlagsString(),
+                item.velocity,
+                item.volume,
+                item.modulation,
+                item.preutter,
+                item.overlap,
+                item.offset,
+                item.durRequired,
+                item.durCorrection,
+                item.consonant,
+                item.cutoff,
+                item.skipOver,
+                item.tempo,
+                item.pitches,
+                item.tension,
+                item.breathiness,
+                item.voicing,
+                item.gender,
+                request = new { posMs, skipMs = item.skipOver, lengthMs, fadeInMs, fadeOutMs },
+            };
+        }
+
+        static readonly MethodInfo sampleCurve = typeof(WorldlineRenderer)
+            .GetMethod("SampleCurve", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        /// <summary>
+        /// The curves WorldlineRenderer.Render samples per frame and passes to PhraseSynthV2.SetCurves.
+        /// </summary>
+        static object ExportSynthCurves(WorldlineRenderer renderer, RenderPhrase phrase) {
+            var frameMs = (double)typeof(WorldlineRenderer).GetField("frameMs", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(renderer)!;
+            var layout = renderer.Layout(phrase);
+            int frames = (int)Math.Ceiling(layout.estimatedLengthMs / frameMs);
+            double[] Sample(float[] curve, double defaultValue, Func<double, double> convert) =>
+                (double[])sampleCurve.Invoke(renderer, new object[] { phrase, curve, defaultValue, frames, convert })!;
+            return new {
+                frameMs,
+                frames,
+                f0 = Sample(phrase.pitches, 0, x => MusicMath.ToneToFreq(x * 0.01)),
+                gender = Sample(phrase.gender, 0.5, x => 0.5 + 0.005 * x),
+                tension = Sample(phrase.tension, 0.5, x => 0.5 + 0.005 * x),
+                breathiness = Sample(phrase.breathiness, 0.5, x => 0.5 + 0.005 * x),
+                voicing = Sample(phrase.voicing, 1.0, x => 0.01 * x),
+            };
+        }
 
         static object ExportPhrase(RenderPhrase phrase, int partPosition) => new {
             phrase.position,
