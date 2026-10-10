@@ -27,6 +27,7 @@ namespace OpenUtau.Core.Golden {
     ///     OpenUtau.Test/bin/Debug/net10.0/OpenUtau.Test -class OpenUtau.Core.Golden.GoldenExportTest
     ///
     /// Outputs (renderer is fixed to WORLDLINE-R; the user's OpenUtau prefs and presets are not read):
+    ///   voicebank.json       the singer as ClassicSinger loads it: info, subbanks, otos and oto lookups (stage 1a)
     ///   ust.json             Ust.Load(reader, file) result, before AfterLoad/Validate (stage 0)
     ///   input.json           notes after Ust.Load(files), i.e. after AfterLoad and ValidateFull (stage 0)
     ///   phonemes.json        phonemizer output after timing validation (stage 1)
@@ -69,6 +70,7 @@ namespace OpenUtau.Core.Golden {
             ToolsManager.Inst.Initialize();
             try {
                 var singer = LoadSinger(singerDir);
+                Write(outDir, "voicebank.json", ExportVoicebank(singer, singerDir));
 
                 using (var reader = new StreamReader(ustPath, Ust.DetectEncoding(ustPath))) {
                     Write(outDir, "ust.json", ExportUst(Ust.Load(reader, ustPath)));
@@ -146,7 +148,8 @@ namespace OpenUtau.Core.Golden {
 
         static ClassicSinger LoadSinger(string singerDir) {
             singerDir = Path.GetFullPath(singerDir);
-            VoicebankLoader.IsTest = true;
+            // Like the app: IsTest stays false, so CheckWavExist runs (it maps oto.ini names to NFD file names).
+            VoicebankLoader.IsTest = false;
             var voicebank = new Voicebank() {
                 File = Path.Join(singerDir, "character.txt"),
                 BasePath = Path.GetDirectoryName(singerDir),
@@ -198,6 +201,57 @@ namespace OpenUtau.Core.Golden {
                 vibrato = new { n.vibrato.length, n.vibrato.period, n.vibrato.depth, n.vibrato.@in, n.vibrato.@out, n.vibrato.shift, n.vibrato.drift },
             }),
         };
+
+        static object ExportVoicebank(ClassicSinger singer, string singerDir) {
+            singerDir = Path.GetFullPath(singerDir);
+            string? Rel(string? path) => string.IsNullOrEmpty(path) ? path : Path.GetRelativePath(singerDir, path);
+            var probes = singer.Otos.Select(o => o.Alias)
+                .Concat(new[] { "R", "-", "あ", "* あ", "a", "", "no such alias" })
+                .Distinct()
+                .ToList();
+            return new {
+                singer.Id,
+                singer.Name,
+                singer.Author,
+                singer.Voice,
+                singer.Web,
+                singer.Version,
+                singer.OtherInfo,
+                singerType = singer.SingerType.ToString(),
+                textFileEncoding = singer.TextFileEncoding?.WebName,
+                singer.DefaultPhonemizer,
+                avatar = Rel(singer.Avatar),
+                sample = Rel(singer.Sample),
+                subbanks = singer.Subbanks.Select(s => new {
+                    s.Color,
+                    s.Prefix,
+                    s.Suffix,
+                    s.ToneRangesString,
+                    tones = s.toneSet.ToArray(),
+                }),
+                otos = singer.Otos.Select(o => new {
+                    o.Alias,
+                    o.Phonetic,
+                    o.Set,
+                    file = Rel(o.File),
+                    o.DisplayFile,
+                    o.Offset,
+                    o.Consonant,
+                    o.Cutoff,
+                    o.Preutter,
+                    o.Overlap,
+                    subbanks = o.Subbanks.Select(s => new { s.Color, s.Prefix, s.Suffix }),
+                }),
+                errors = singer.Errors,
+                lookups = probes.SelectMany(phoneme => new[] { 48, 60, 72 }.Select(tone => new {
+                    phoneme,
+                    tone,
+                    oto = singer.TryGetOto(phoneme, out var o1) ? o1.Alias : null,
+                    mapped = singer.TryGetMappedOto(phoneme, tone, out var o2) ? o2.Alias : null,
+                    mappedMainColor = singer.TryGetMappedOto(phoneme, tone, string.Empty, out var o3) ? o3.Alias : null,
+                })),
+            };
+        }
 
         static object ExportUst(UProject project) {
             var track = project.tracks[0];
