@@ -30,6 +30,7 @@ namespace OpenUtau.Core.Golden {
     ///   voicebank.json       the singer as ClassicSinger loads it: info, subbanks, otos and oto lookups (stage 1a)
     ///   ust.json             Ust.Load(reader, file) result, before AfterLoad/Validate (stage 0)
     ///   input.json           notes after Ust.Load(files), i.e. after AfterLoad and ValidateFull (stage 0)
+    ///   phonemizer.json      validated notes, the note groups sent to the phonemizer and its raw output (stage 1b)
     ///   phonemes.json        phonemizer output after timing validation (stage 1)
     ///   phrases.json         RenderPhrase.FromPart output (stage 2)
     ///   resampler_items.json ResamplerItem per phone, and the PhraseSynthV2.AddRequest arguments (stage 3)
@@ -83,6 +84,7 @@ namespace OpenUtau.Core.Golden {
                 track.RendererSettings.renderer = Renderers.WORLDLINE_R;
 
                 Phonemize(project, part);
+                Write(outDir, "phonemizer.json", ExportPhonemizer(track, part));
                 var phrases = RenderPhrase.FromPart(project, track, part);
 
                 Write(outDir, "input.json", ExportInput(project, part, ustPath, singerDir));
@@ -279,6 +281,67 @@ namespace OpenUtau.Core.Golden {
                     },
                     vibrato = new { n.vibrato.length, n.vibrato.period, n.vibrato.depth, n.vibrato.@in, n.vibrato.@out, n.vibrato.shift, n.vibrato.drift, n.vibrato.volLink },
                     expressions = n.phonemeExpressions.Select(e => new { e.abbr, e.index, e.value }),
+                }),
+            };
+        }
+
+        static object ExportPhonemizer(UTrack track, UVoicePart part) {
+            var notes = part.notes.ToList();
+            int? IndexOf(UNote? n) => n == null ? null : notes.IndexOf(n);
+            // The note groups UVoicePart.Validate sends to the phonemizer: each note that does not overlap and
+            // is not an extender, with the extender notes that follow it.
+            var groups = new List<object>();
+            for (int i = 0; i < notes.Count; i++) {
+                var note = notes[i];
+                if (note.OverlapError || note.Extends != null) {
+                    continue;
+                }
+                var group = new List<UNote> { note };
+                var next = note.Next;
+                while (next != null && next.Extends == note) {
+                    group.Add(next);
+                    next = next.Next;
+                }
+                groups.Add(new {
+                    noteIndex = i,
+                    notes = group.Select(n => n.ToPhonemizerNote(track, part)).Select(pn => new {
+                        pn.lyric,
+                        pn.phoneticHint,
+                        pn.tone,
+                        pn.position,
+                        pn.duration,
+                        phonemeAttributes = pn.phonemeAttributes.Select(a => new {
+                            a.index, a.consonantStretchRatio, a.toneShift, a.alternate, a.voiceColor,
+                        }),
+                    }),
+                });
+            }
+            return new {
+                phonemizer = track.Phonemizer.GetType().FullName,
+                voiceColorOptions = track.VoiceColorExp?.options,
+                notes = notes.Select((n, i) => new {
+                    index = i,
+                    n.position,
+                    n.duration,
+                    n.PositionMs,
+                    n.EndMs,
+                    prev = IndexOf(n.Prev),
+                    next = IndexOf(n.Next),
+                    extends = IndexOf(n.Extends),
+                    n.ExtendedDuration,
+                    n.Error,
+                    n.OverlapError,
+                    pitch = n.pitch.data.Select(p => new { p.X, p.Y, shape = p.shape.ToString() }),
+                    n.phonemeIndexes,
+                    phonemizerExpressions = n.phonemizerExpressions.Select(e => new { e.abbr, e.index, e.value }),
+                }),
+                groups,
+                phonemes = part.phonemes.Select(p => new {
+                    noteIndex = IndexOf(p.Parent),
+                    p.index,
+                    p.rawPhoneme,
+                    p.rawPosition,
+                    error = p.ErrorException?.Message,
                 }),
             };
         }
