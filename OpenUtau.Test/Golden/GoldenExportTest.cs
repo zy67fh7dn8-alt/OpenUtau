@@ -31,6 +31,8 @@ namespace OpenUtau.Core.Golden {
     ///   ust.json             Ust.Load(reader, file) result, before AfterLoad/Validate (stage 0)
     ///   input.json           notes after Ust.Load(files), i.e. after AfterLoad and ValidateFull (stage 0)
     ///   phonemizer.json      validated notes, the note groups sent to the phonemizer and its raw output (stage 1b)
+    ///   saved.ust            Ust.SavePart after phonemizing, Shift_JIS; VoiceDir / CacheDir values replaced by
+    ///                        <singer> / <cache> since they are machine specific
     ///   phonemes.json        phonemizer output after timing validation (stage 1)
     ///   phrases.json         RenderPhrase.FromPart output (stage 2)
     ///   resampler_items.json ResamplerItem per phone, and the PhraseSynthV2.AddRequest arguments (stage 3)
@@ -85,6 +87,7 @@ namespace OpenUtau.Core.Golden {
 
                 Phonemize(project, part);
                 Write(outDir, "phonemizer.json", ExportPhonemizer(track, part));
+                ExportSavedUst(project, part, Path.Join(outDir, "saved.ust"), tempDir);
                 var phrases = RenderPhrase.FromPart(project, track, part);
 
                 Write(outDir, "input.json", ExportInput(project, part, ustPath, singerDir));
@@ -283,6 +286,17 @@ namespace OpenUtau.Core.Golden {
                     expressions = n.phonemeExpressions.Select(e => new { e.abbr, e.index, e.value }),
                 }),
             };
+        }
+
+        static void ExportSavedUst(UProject project, UVoicePart part, string path, string tempDir) {
+            var tmp = Path.Join(tempDir, "saved.ust");
+            Ust.SavePart(project, part, tmp);
+            var shiftJis = Encoding.GetEncoding("shift_jis");
+            var lines = File.ReadAllLines(tmp, shiftJis).Select(line =>
+                line.StartsWith("VoiceDir=") ? "VoiceDir=<singer>" :
+                line.StartsWith("CacheDir=") ? "CacheDir=<cache>" : line);
+            // StreamWriter.WriteLine writes Environment.NewLine ("\n" on macOS).
+            File.WriteAllText(path, string.Join("\n", lines) + "\n", shiftJis);
         }
 
         static object ExportPhonemizer(UTrack track, UVoicePart part) {
